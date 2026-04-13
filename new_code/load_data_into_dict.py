@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import pandas as pd
 from pynwb import NWBHDF5IO
 
 # fMRI (optional)
@@ -15,7 +15,6 @@ import traceback
 # signal processing
 from scipy.signal import butter, sosfiltfilt, hilbert
 from collections.abc import Iterable
-
 
 # -----------------------
 # Subject mapping (int -> ids)
@@ -60,6 +59,7 @@ def find_nwb_file_for_subject(nwb_root: Union[str, Path], nwb_sub: str) -> Path:
 # Time utilities
 # -----------------------
 def times_from_rate(T: int, rate: float, starting_time: float = 0.0) -> np.ndarray:
+    # t[i] = starting_time + i/rate
     return starting_time + np.arange(T, dtype=np.float64) / float(rate)
 
 
@@ -76,6 +76,7 @@ def get_ts_data_and_time(ts, max_samples: Optional[int] = None) -> Tuple[np.ndar
     rate = getattr(ts, "rate", None)
     starting_time = getattr(ts, "starting_time", 0.0)
 
+    # timestamps can be large; only load if present
     if getattr(ts, "timestamps", None) is not None:
         if max_samples is None:
             t = np.asarray(ts.timestamps[:], dtype=np.float64)
@@ -93,10 +94,6 @@ def resample_continuous(x: np.ndarray, t_src: np.ndarray, t_dst: np.ndarray) -> 
     """
     x: (T,) or (T,C). Linear interpolation onto t_dst.
     """
-    x = np.asarray(x)
-    t_src = np.asarray(t_src, dtype=np.float64)
-    t_dst = np.asarray(t_dst, dtype=np.float64)
-
     if x.ndim == 1:
         return np.interp(t_dst, t_src, x).astype(np.float32)
     elif x.ndim == 2:
@@ -107,7 +104,6 @@ def resample_continuous(x: np.ndarray, t_src: np.ndarray, t_dst: np.ndarray) -> 
     else:
         raise ValueError(f"resample_continuous expects 1D or 2D, got {x.ndim}D")
 
-
 def _pick_first_series(container, prefer: Optional[List[str]] = None) -> str:
     """
     container: a MultiContainerInterface-like object with .keys() and __getitem__ expecting str
@@ -117,6 +113,7 @@ def _pick_first_series(container, prefer: Optional[List[str]] = None) -> str:
     keys_raw = list(container.keys())
     keys_str = [k if isinstance(k, str) else str(k) for k in keys_raw]
 
+    # optional preference ordering
     if prefer:
         prefer_l = [p.lower() for p in prefer]
         keys_str = sorted(
@@ -127,72 +124,40 @@ def _pick_first_series(container, prefer: Optional[List[str]] = None) -> str:
     last_err = None
     for k in keys_str:
         try:
-            _ = container[k]
+            _ = container[k]   # probe
             return k
         except Exception as e:
             last_err = e
             continue
 
-    raise TypeError(
-        f"Could not index container with any stringified key. "
-        f"raw keys={keys_raw[:10]}... last_err={repr(last_err)}"
-    )
-
+    raise TypeError(f"Could not index container with any stringified key. "
+                    f"raw keys={keys_raw[:10]}... last_err={repr(last_err)}")
 
 # -----------------------
 # Spikes -> firing rate
 # -----------------------
-def spikes_to_firing_rate(
-    spike_times_list: List[np.ndarray],
-    t_grid: np.ndarray,
-    bin_width: float,
-) -> np.ndarray:
+def spikes_to_firing_rate(spike_times_list: List[np.ndarray], t_grid: np.ndarray) -> np.ndarray:
     """
     Bin spikes into firing rate on t_grid (sec).
-
-    We interpret t_grid as bin centers. The bin width is explicitly controlled by
-    `bin_width` instead of always using median(diff(t_grid)).
-
+    We interpret t_grid as bin centers; derive bin edges from midpoints.
     Output shape: (T, n_units) in Hz.
     """
     T = len(t_grid)
     n_units = len(spike_times_list)
-    if T < 1:
-        raise ValueError("t_grid must have at least 1 point.")
-    if bin_width is None or bin_width <= 0:
-        raise ValueError(f"bin_width must be positive, got {bin_width}")
+    if T < 2:
+        raise ValueError("t_grid must have at least 2 points.")
 
-    t_grid = np.asarray(t_grid, dtype=np.float64)
-    half_bw = float(bin_width) / 2.0
-    edges = np.concatenate(([t_grid[0] - half_bw], t_grid + half_bw))
-
+    # bin edges from centers
+    dt = np.median(np.diff(t_grid))
+    edges = np.concatenate(([t_grid[0] - dt/2], t_grid + dt/2))
     fr = np.zeros((T, n_units), dtype=np.float32)
+
     for i, st in enumerate(spike_times_list):
         if st is None or len(st) == 0:
             continue
-        st = np.asarray(st, dtype=np.float64)
         counts, _ = np.histogram(st, bins=edges)
-        fr[:, i] = counts.astype(np.float32) / float(bin_width)
+        fr[:, i] = counts.astype(np.float32) / float(dt)  # Hz
     return fr
-
-
-def convert_lfp_time_to_movie_reference(t_raw, baseline_pre_movie=10.0, atol=1e-3):
-    t_raw = np.asarray(t_raw, dtype=np.float64)
-
-    if len(t_raw) == 0:
-        return t_raw
-
-    if np.isclose(t_raw[0], -baseline_pre_movie, atol=atol):
-        return t_raw
-
-    if np.isclose(t_raw[0], 0.0, atol=atol):
-        return t_raw - baseline_pre_movie
-
-    print(
-        f"[WARN] Unexpected LFP time start {t_raw[0]:.6f}; "
-        f"leaving unchanged. Please verify ElectricalSeries.starting_time."
-    )
-    return t_raw
 
 
 # -----------------------
@@ -256,11 +221,12 @@ def load_eye_gaze_and_pupil(nwbfile, max_samples: Optional[int] = None):
     pupil = None
     t_eye = None
 
+    # IMPORTANT: do NOT use `if "EyeTracking" in beh` (can trigger bad __contains__)
     beh_keys_raw = list(beh.keys())
     beh_keys_str = {k if isinstance(k, str) else str(k) for k in beh_keys_raw}
 
     if "EyeTracking" in beh_keys_str:
-        et = beh["EyeTracking"]
+        et = beh["EyeTracking"]  # now safe, we only index with str
         key = _pick_first_series(et.spatial_series, prefer=["SpatialSeries", "gaze"])
         ts = et.spatial_series[key]
         data, t, _ = get_ts_data_and_time(ts, max_samples=max_samples)
@@ -290,13 +256,14 @@ def load_spikes_units(nwbfile) -> List[np.ndarray]:
         return []
     spikes = []
     for st in df["spike_times"].values:
+        # st is typically an array-like of spike times
         spikes.append(np.asarray(st, dtype=np.float64))
     return spikes
 
 
 def load_movie_time(nwbfile, max_samples: Optional[int] = None) -> np.ndarray:
     """
-    Use stimulus['movieframe_time'] as movie frame index.
+    Use stimulus['movieframe_time'] as the common time grid (seconds).
     """
     stim = nwbfile.stimulus
     if "movieframe_time" not in stim:
@@ -308,126 +275,17 @@ def load_movie_time(nwbfile, max_samples: Optional[int] = None) -> np.ndarray:
 
 
 # -----------------------
-# NaN filling
-# -----------------------
-def _to_2d_array(x):
-    x = np.asarray(x, dtype=np.float64)
-    if x.ndim == 1:
-        x = x[:, None]
-    return x
-
-
-def _restore_shape(x_filled, original):
-    original = np.asarray(original)
-    if original.ndim == 1:
-        return x_filled[:, 0]
-    return x_filled
-
-
-def _interp_fill(x):
-    x2 = _to_2d_array(x)
-    df = pd.DataFrame(x2)
-    df = df.interpolate(method="linear", limit_direction="both")
-    df = df.ffill().bfill()
-    return _restore_shape(df.values, x)
-
-
-def _ffill_bfill(x):
-    x2 = _to_2d_array(x)
-    df = pd.DataFrame(x2)
-    df = df.ffill().bfill()
-    return _restore_shape(df.values, x)
-
-
-def _zero_fill(x):
-    x = np.asarray(x, dtype=np.float64)
-    return np.nan_to_num(x, nan=0.0)
-
-
-def _fill_gaze_pixel(x):
-    return _interp_fill(x)
-
-
-def fill_nan_by_modality(sub_dict, fill_bold: bool = False):
-    """
-    sub_dict: out[sub] 这一层 dict
-    只填充模态数据中的 NaN，不修改 time_grid / meta / time_raw
-    """
-    d = sub_dict.copy()
-
-    if "spikes" in d and d["spikes"] is not None:
-        if isinstance(d["spikes"], list):
-            filled_spikes = []
-            for s in d["spikes"]:
-                if s is None:
-                    filled_spikes.append(s)
-                else:
-                    filled_spikes.append(_zero_fill(s))
-            d["spikes"] = filled_spikes
-        else:
-            d["spikes"] = _zero_fill(d["spikes"])
-
-    if "firing_rate" in d and d["firing_rate"] is not None:
-        d["firing_rate"] = _zero_fill(d["firing_rate"])
-
-    for k in ["lfp_macro", "lfp_micro"]:
-        if k in d and d[k] is not None:
-            d[k] = _interp_fill(d[k])
-
-    if "lfp_bandpower" in d and d["lfp_bandpower"] is not None:
-        if isinstance(d["lfp_bandpower"], dict):
-            filled_bp = {}
-            for band_name, bp in d["lfp_bandpower"].items():
-                if bp is None:
-                    filled_bp[band_name] = None
-                else:
-                    filled_bp[band_name] = _interp_fill(bp)
-            d["lfp_bandpower"] = filled_bp
-        else:
-            d["lfp_bandpower"] = _interp_fill(d["lfp_bandpower"])
-
-    if "eye_gaze" in d and d["eye_gaze"] is not None:
-        d["eye_gaze"] = _fill_gaze_pixel(d["eye_gaze"])
-
-    if "pupil" in d and d["pupil"] is not None:
-        d["pupil"] = _ffill_bfill(d["pupil"])
-
-    if fill_bold and "bold" in d and d["bold"] is not None:
-        if isinstance(d["bold"], list):
-            filled_bold = []
-            for b in d["bold"]:
-                if b is None:
-                    filled_bold.append(None)
-                else:
-                    filled_bold.append(_interp_fill(b))
-            d["bold"] = filled_bold
-        else:
-            d["bold"] = _interp_fill(d["bold"])
-
-    return d
-
-
-# -----------------------
 # fMRI optional extraction
 # -----------------------
-def load_bold_timeseries_wholebrain(
-    bids_root: Union[str, Path],
-    bids_sub: str,
-    max_runs: Optional[int] = None
-) -> List[np.ndarray]:
+def load_bold_timeseries_wholebrain(bids_root: Union[str, Path], bids_sub: str, max_runs: Optional[int] = None) -> List[np.ndarray]:
     """
     Returns list of arrays (T,V). Uses nilearn NiftiMasker.
     """
     from nilearn.maskers import NiftiMasker
 
     layout = BIDSLayout(str(bids_root), validate=False)
-    bold_files: List[str] = layout.get(
-        subject=bids_sub,
-        datatype="func",
-        suffix="bold",
-        extension=["nii", "nii.gz"],
-        return_type="file"
-    )
+    bold_files: List[str] = layout.get(subject=bids_sub, datatype="func", suffix="bold",
+                                       extension=["nii", "nii.gz"], return_type="file")
     if max_runs is not None:
         bold_files = bold_files[:max_runs]
 
@@ -435,7 +293,7 @@ def load_bold_timeseries_wholebrain(
     out = []
     for f in bold_files:
         img = nib.load(f)
-        X = masker.fit_transform(img)
+        X = masker.fit_transform(img)  # (T,V)
         out.append(X.astype(np.float32))
     return out
 
@@ -443,44 +301,26 @@ def load_bold_timeseries_wholebrain(
 # -----------------------
 # Main multimodal loader
 # -----------------------
-def load_multimodal_subjects_movie_aligned(
+def load_multimodal_subjects(
     sub_nums: Union[Iterable[int], set],
     nwb_root: Union[str, Path],
     bids_root: Union[str, Path],
     *,
     max_nwb_samples: Optional[int] = None,
-
-    # analysis grid
-    grid_source: str = "movie_frame_time",   # {"movie_frame_time", "uniform", "lfp_raw"}
+    resample_lfp: bool = False,
+    use_movie_time_as_grid: bool = True,
     grid_dt: Optional[float] = None,
-    uniform_grid_include_baseline: bool = True,
-
-    # feature computation
     compute_firing_rate: bool = True,
-    firing_rate_bin_width: Optional[float] = None,
     compute_lfp_bandpower: bool = True,
-    lfp_bandpower_on_raw: bool = True,
     bands: Optional[Dict[str, Tuple[float, float]]] = None,
-
-    # optional fmri
     load_fmri: bool = False,
     fmri_max_runs: Optional[int] = None,
-
     verbose: bool = True,
-    **kwargs,
+    **kwargs,   # <-- 兼容多余参数，避免 TypeError
 ) -> Dict[int, Dict[str, Any]]:
-    """
-    Paper-consistent movie-aligned loader.
 
-    Time convention:
-        movie start = 0
-        LFP/iEEG baseline before movie = negative time (typically [-10, 0))
-        movieframe_time in NWB is treated as frame index
-        movieframe_time_sec = movieframe_time / movie_fps_nominal
-        spikes are already referenced to movie start per paper
-    """
     if kwargs and verbose:
-        print(f"[WARN] ignored kwargs: {sorted(kwargs.keys())}")
+        print(f"[WARN] load_multimodal_subjects ignored kwargs: {sorted(kwargs.keys())}")
 
     if bands is None:
         bands = {
@@ -500,245 +340,159 @@ def load_multimodal_subjects_movie_aligned(
         bids_sub = bids_subject_from_int(sub)
         nwb_sub = nwb_subject_from_int(sub)
 
-        io = None
         nwb_path = None
-
-        if sub not in out:
-            out[sub] = {}
+        io = None
 
         try:
             nwb_path = find_nwb_file_for_subject(nwb_root, nwb_sub)
+
             io = NWBHDF5IO(str(nwb_path), "r", load_namespaces=True)
             nwbfile = io.read()
 
-            # =========================================================
-            # 1) Load raw LFP / iEEG
-            # =========================================================
-            lfp_macro, t_macro_raw, fs_macro = load_lfp_container(
+            # -----------------------------
+            # 1) 先读 LFP（拿到原始时间轴）
+            # -----------------------------
+            lfp_macro, t_macro, fs_macro = load_lfp_container(
                 nwbfile, "LFP_macro", max_samples=max_nwb_samples
             )
-            lfp_micro, t_micro_raw, fs_micro = load_lfp_container(
+            lfp_micro, t_micro, fs_micro = load_lfp_container(
                 nwbfile, "LFP_micro", max_samples=max_nwb_samples
             )
 
-            t_macro_movie = convert_lfp_time_to_movie_reference(
-                t_macro_raw, baseline_pre_movie=10.0
-            )
-            t_micro_movie = convert_lfp_time_to_movie_reference(
-                t_micro_raw, baseline_pre_movie=10.0
-            )
+            if verbose:
+                print(f"[sub {sub}] nwb_path={nwb_path}")
+                print(f"[sub {sub}] lfp_macro shape={lfp_macro.shape} dtype={lfp_macro.dtype}")
+                print(f"[sub {sub}] t_macro len={len(t_macro)} range=({t_macro[0]:.3f}, {t_macro[-1]:.3f}) fs={fs_macro}")
+                print(f"[sub {sub}] lfp_macro min/max=({float(np.min(lfp_macro)):.3f}, {float(np.max(lfp_macro)):.3f})")
 
-            # =========================================================
-            # 2) Load movie frame index and derive seconds
-            # =========================================================
-            movieframe_time = load_movie_time(nwbfile, max_samples=max_nwb_samples)
-            movieframe_time = np.asarray(movieframe_time, dtype=np.float64)
+            # -----------------------------
+            # 2) 决定公共时间网格 t_grid
+            #    - 你现在要“先观测原始数据”
+            #    - resample_lfp=False => t_grid = t_macro（完整 LFP 采样）
+            # -----------------------------
+            movie_time = None
+            movie_time_error = None
 
-            movie_fps_nominal = 25.0
-            movieframe_time_sec = movieframe_time / movie_fps_nominal
-
-            # =========================================================
-            # 3) Load eye tracking
-            # =========================================================
-            gaze, pupil, t_eye_raw = load_eye_gaze_and_pupil(
-                nwbfile, max_samples=max_nwb_samples
-            )
-
-            if t_eye_raw is not None:
-                t_eye_raw = np.asarray(t_eye_raw, dtype=np.float64)
-
-            t_eye_movie = t_eye_raw
-
-            fs_eye = None
-            if t_eye_movie is not None and len(t_eye_movie) > 1:
-                dt_eye = np.median(np.diff(t_eye_movie))
-                if dt_eye > 0:
-                    fs_eye = 1.0 / dt_eye
-
-            # =========================================================
-            # 4) Load spikes
-            # =========================================================
-            spikes_list = load_spikes_units(nwbfile)
-
-            # =========================================================
-            # 5) Choose common analysis grid
-            # =========================================================
-            if grid_source == "movie_frame_time":
-                t_grid = movieframe_time_sec
-
-            elif grid_source == "uniform":
-                if grid_dt is None:
-                    raise ValueError("grid_dt must be provided when grid_source='uniform'.")
-
-                if uniform_grid_include_baseline:
-                    t0 = float(min(t_macro_movie[0], movieframe_time_sec[0]))
-                else:
-                    t0 = float(movieframe_time_sec[0])
-
-                t1 = float(max(
-                    movieframe_time_sec[-1],
-                    t_macro_movie[-1],
-                    t_micro_movie[-1] if len(t_micro_movie) > 0 else movieframe_time_sec[-1]
-                ))
-
-                t_grid = np.arange(t0, t1 + 0.5 * grid_dt, float(grid_dt), dtype=np.float64)
-
-            elif grid_source == "lfp_raw":
-                t_grid = t_macro_movie
-
+            if not resample_lfp:
+                t_grid = t_macro
             else:
-                raise ValueError(
-                    f"Unknown grid_source={grid_source!r}. "
-                    f"Use one of: 'movie_frame_time', 'uniform', 'lfp_raw'."
-                )
+                if use_movie_time_as_grid:
+                    # 用 movie frame time 作为网格（会很稀疏，仅在你明确要这样时用）
+                    t_grid = load_movie_time(nwbfile, max_samples=max_nwb_samples)
+                else:
+                    if grid_dt is None:
+                        raise ValueError("If use_movie_time_as_grid=False you must provide grid_dt.")
+                    t0, t1 = float(t_macro[0]), float(t_macro[-1])
+                    t_grid = np.arange(t0, t1, float(grid_dt), dtype=np.float64)
 
-            # =========================================================
-            # 6) Continuous modalities -> resample
-            # =========================================================
-            lfp_macro_rs = resample_continuous(lfp_macro, t_macro_movie, t_grid)
-            lfp_micro_rs = resample_continuous(lfp_micro, t_micro_movie, t_grid)
+            # movie_time 单独读出来（用于对齐/标注事件），不再用于强制重采样
+            if use_movie_time_as_grid:
+                try:
+                    movie_time = load_movie_time(nwbfile, max_samples=max_nwb_samples)
+                except Exception as e:
+                    movie_time_error = repr(e)
+                    movie_time = None
+
+            if verbose:
+                print(f"[sub {sub}] resample_lfp={resample_lfp} -> t_grid len={len(t_grid)} "
+                      f"(expect == len(t_macro) when resample_lfp=False)")
+                if movie_time is not None:
+                    print(f"[sub {sub}] movie_time len={len(movie_time)} range=({movie_time[0]:.3f}, {movie_time[-1]:.3f})")
+                else:
+                    print(f"[sub {sub}] movie_time=None ({movie_time_error})")
+
+            # -----------------------------
+            # 3) LFP 是否重采样
+            # -----------------------------
+            if resample_lfp:
+                lfp_macro_rs = resample_continuous(lfp_macro, t_macro, t_grid)
+                lfp_micro_rs = resample_continuous(lfp_micro, t_micro, t_grid)
+            else:
+                lfp_macro_rs = lfp_macro
+                lfp_micro_rs = lfp_micro
+
+            # -----------------------------
+            # 4) Eye + pupil（如果你只看 LFP，可之后再关掉）
+            # -----------------------------
+            gaze, pupil, t_eye = load_eye_gaze_and_pupil(nwbfile, max_samples=max_nwb_samples)
 
             gaze_rs = None
-            if gaze is not None and t_eye_movie is not None:
-                gaze_rs = resample_continuous(gaze, t_eye_movie, t_grid)
+            if gaze is not None and t_eye is not None:
+                gaze_rs = resample_continuous(gaze, t_eye, t_grid)
                 if gaze_rs.ndim == 2 and gaze_rs.shape[1] >= 2:
                     gaze_rs = gaze_rs[:, :2]
 
             pupil_rs = None
-            if pupil is not None and t_eye_movie is not None:
-                pupil_rs = resample_continuous(pupil, t_eye_movie, t_grid).astype(np.float32).squeeze()
+            if pupil is not None and t_eye is not None:
+                pupil_rs = resample_continuous(pupil, t_eye, t_grid).astype(np.float32).squeeze()
 
-            # =========================================================
-            # 7) Spikes -> firing rate
-            # =========================================================
-            if compute_firing_rate:
-                if firing_rate_bin_width is None:
-                    if len(t_grid) > 1:
-                        firing_rate_bin_width = float(np.median(np.diff(t_grid)))
-                    else:
-                        raise ValueError("Cannot infer firing_rate_bin_width from a grid of length < 2.")
+            # -----------------------------
+            # 5) Spikes -> firing rate（t_grid 很密时会很稀疏，但能跑）
+            # -----------------------------
+            spikes_list = load_spikes_units(nwbfile)
+            firing_rate = spikes_to_firing_rate(spikes_list, t_grid) if compute_firing_rate else None
 
-                firing_rate = spikes_to_firing_rate(
-                    spike_times_list=spikes_list,
-                    t_grid=t_grid,
-                    bin_width=firing_rate_bin_width,
-                )
-            else:
-                firing_rate = None
-
-            # =========================================================
-            # 8) LFP band power
-            # =========================================================
+            # -----------------------------
+            # 6) LFP band power（注意：如果你 resample 且 grid_dt 改了，fs 也要跟着变）
+            # -----------------------------
             lfp_bandpower: Dict[str, np.ndarray] = {}
-
             if compute_lfp_bandpower:
-                if lfp_bandpower_on_raw:
-                    for name, band in bands.items():
-                        bp_raw = bandpower_hilbert(lfp_macro, fs=fs_macro, band=band)
-                        bp_rs = resample_continuous(bp_raw, t_macro_movie, t_grid)
-                        lfp_bandpower[name] = bp_rs
-                else:
-                    if len(t_grid) < 2:
-                        raise ValueError("t_grid too short for resampled bandpower computation.")
-                    dt_grid_local = np.median(np.diff(t_grid))
-                    fs_grid = 1.0 / float(dt_grid_local)
+                fs_for_bp = fs_macro if (not resample_lfp or grid_dt is None) else (1.0 / float(grid_dt))
+                for name, band in bands.items():
+                    lfp_bandpower[name] = bandpower_hilbert(lfp_macro_rs, fs=fs_for_bp, band=band)
 
-                    for name, band in bands.items():
-                        lfp_bandpower[name] = bandpower_hilbert(
-                            lfp_macro_rs, fs=fs_grid, band=band
-                        )
-
-            # =========================================================
-            # 9) fMRI
-            # =========================================================
+            # -----------------------------
+            # 7) fMRI（可选）
+            # -----------------------------
             bold_list: List[np.ndarray] = []
             fmri_error = None
             if load_fmri:
                 try:
-                    bold_list = load_bold_timeseries_wholebrain(
-                        bids_root, bids_sub, max_runs=fmri_max_runs
-                    )
+                    bold_list = load_bold_timeseries_wholebrain(bids_root, bids_sub, max_runs=fmri_max_runs)
                 except Exception as e:
                     fmri_error = repr(e)
                     bold_list = []
 
-            # =========================================================
-            # 10) Output
-            # =========================================================
+            # -----------------------------
+            # 8) 输出
+            # -----------------------------
             out[sub] = {
                 "spikes": spikes_list,
                 "firing_rate": firing_rate,
-
                 "lfp_macro": lfp_macro_rs,
                 "lfp_micro": lfp_micro_rs,
                 "lfp_bandpower": lfp_bandpower,
                 "eye_gaze": gaze_rs,
                 "pupil": pupil_rs,
-
-                "time_grid": np.asarray(t_grid, dtype=np.float64),
-
-                # keep exact movie frame index
-                "movieframe_time": np.asarray(movieframe_time, dtype=np.float64),
-                # derived second-scale movie time
-                "movieframe_time_sec": np.asarray(movieframe_time_sec, dtype=np.float64),
-
-                "time_raw": {
-                    "lfp_macro": t_macro_movie,
-                    "lfp_micro": t_micro_movie,
-                    "eye": None if t_eye_movie is None else np.asarray(t_eye_movie, dtype=np.float64),
-                },
-
+                "time_grid": np.asarray(t_grid, dtype=np.float64),  # <-- 真实公共时间轴
+                "movie_time": None if movie_time is None else np.asarray(movie_time, dtype=np.float64),
                 "bold": bold_list,
-
                 "meta": {
                     "sub": sub,
                     "bids_sub": bids_sub,
                     "nwb_sub": nwb_sub,
                     "nwb_path": str(nwb_path),
-
-                    "fs_macro_raw": fs_macro,
-                    "fs_micro_raw": fs_micro,
-                    "fs_eye_raw": fs_eye,
-                    "movie_fps_nominal": movie_fps_nominal,
-
-                    "grid_source": grid_source,
-                    "grid_dt": None if len(t_grid) < 2 else float(np.median(np.diff(t_grid))),
-                    "time_reference": "movie_start_is_zero",
-
-                    "lfp_baseline_seconds_pre_movie": 10.0,
-                    "spikes_are_movie_referenced": True,
-                    "lfp_is_movie_referenced_after_conversion": True,
-                    "movieframe_time_is_frame_index": True,
-
+                    "fs_macro": fs_macro,
+                    "fs_micro": fs_micro,
                     "n_units": len(spikes_list),
                     "fmri_error": fmri_error,
+                    "movie_time_error": movie_time_error,
+                    "resample_lfp": resample_lfp,
                     "max_nwb_samples": max_nwb_samples,
                 },
             }
 
-            out[sub] = fill_nan_by_modality(out[sub])
-
-            if verbose:
-                print(f"[sub {sub}] nwb_path={nwb_path}")
-                print(f"[sub {sub}] fs_macro={fs_macro}, fs_micro={fs_micro}, fs_eye={fs_eye}")
-                print(f"[sub {sub}] t_macro_movie range=({t_macro_movie[0]:.3f}, {t_macro_movie[-1]:.3f})")
-                print(f"[sub {sub}] movieframe_time(frame) range=({movieframe_time[0]:.3f}, {movieframe_time[-1]:.3f})")
-                print(f"[sub {sub}] movieframe_time_sec range=({movieframe_time_sec[0]:.3f}, {movieframe_time_sec[-1]:.3f})")
-                print(f"[sub {sub}] t_grid len={len(t_grid)} source={grid_source}")
-
         except Exception as e:
-            if sub not in out:
-                out[sub] = {}
-            meta = out[sub].get("meta", {})
-            meta.update({
-                "sub": sub,
-                "bids_sub": bids_sub,
-                "nwb_sub": nwb_sub,
-                "nwb_path": str(nwb_path) if nwb_path else None,
-                "error": repr(e),
-                "traceback": traceback.format_exc(),
-            })
-            out[sub]["meta"] = meta
+            out[sub] = {
+                "meta": {
+                    "sub": sub,
+                    "bids_sub": bids_sub,
+                    "nwb_sub": nwb_sub,
+                    "nwb_path": str(nwb_path) if nwb_path else None,
+                    "error": repr(e),
+                    "traceback": traceback.format_exc(),
+                }
+            }
 
         finally:
             if io is not None:
