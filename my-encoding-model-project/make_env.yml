@@ -1,0 +1,30 @@
+name: my-encoding-model-project
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.8
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - statsmodels
+  - mne
+  - nilearn
+  - jupyterlab
+  - ipykernel
+  - scipy
+  - h5py
+  - dask
+  - tqdm
+  - pydicom
+  - nibabel
+  - plotly
+  - pycortex
+  - jupyter_contrib_nbextensions
+  - jupyter_nbextensions_configurator
+  - pip
+  - pip:
+      - dandi
+      - datalad
